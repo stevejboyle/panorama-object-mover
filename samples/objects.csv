@@ -1,0 +1,6 @@
+object_name,object_type,src_scope,dst_scope
+test-addr-1,address,Branch1,shared
+test-svc-1,service,shared,Branch2
+vip-db,address,DC-Core,Branch2
+web-ports,service-group,shared,shared
+prod-tags,address-group,Branch1,DC-Core
