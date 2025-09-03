@@ -89,5 +89,5 @@ Each row contains the full `<entry ...>...</entry>` XML. You can restore by `set
 
 ---
 
-**Author:** Steve + ChatGPT  
+**Author:** Steve Boyle - PANW (NOT OFFICIALLY SUPPORTED) 
 MIT License
