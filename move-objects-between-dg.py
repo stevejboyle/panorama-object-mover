@@ -9,7 +9,9 @@ Inputs
 ------
 - panw.cfg: key=value lines with:
     panorama_ip=1.2.3.4
-    api_key=YOUR_API_KEY
+    api_key=YOUR_API_KEY        (or set PANOS_API_KEY in the environment)
+    verify_ssl=true             (optional; false only for a lab Panorama)
+    ca_bundle=/path/to/ca.pem   (optional; trust a private CA)
 - objects.csv: columns:
     object_name,object_type,src_scope,dst_scope
   where scope is either a device group name or the literal "shared"
@@ -40,7 +42,6 @@ import os
 import sys
 from typing import Optional
 
-requests.packages.urllib3.disable_warnings()
 
 SUPPORTED_TYPES = {
     "address": "address",
@@ -61,10 +62,21 @@ def read_config(cfg_file="panw.cfg"):
             if "=" in line:
                 k, v = line.split("=", 1)
                 cfg[k.strip()] = v.strip()
+    if os.environ.get("PANOS_API_KEY"):
+        cfg["api_key"] = os.environ["PANOS_API_KEY"]
     for k in ("panorama_ip", "api_key"):
         if k not in cfg:
             raise ValueError(f"Missing '{k}' in {cfg_file}")
     return cfg
+
+def tls_verify(cfg):
+    """requests `verify` value: CA bundle path, or bool (default True)."""
+    if cfg.get("ca_bundle"):
+        return cfg["ca_bundle"]
+    verify = cfg.get("verify_ssl", "true").lower() not in ("false", "no", "0", "off")
+    if not verify:
+        requests.packages.urllib3.disable_warnings()
+    return verify
 
 def open_logger():
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -76,26 +88,35 @@ def open_logger():
 
 # --- Panorama API helpers -----------------------------------------------------
 
-def api_get_config(pan_ip, api_key, xpath):
-    url = f"https://{pan_ip}/api/"
-    params = {"type": "config", "action": "get", "key": api_key, "xpath": xpath}
-    r = requests.get(url, params=params, verify=False, timeout=60)
+class PanError(Exception):
+    pass
+
+SESSION = requests.Session()
+
+def api_call(pan_ip, api_key, **params):
+    """POST to the XML API with the key in the X-PAN-KEY header (never in the
+    URL). PAN-OS answers HTTP 200 even on failure, so the <response status>
+    is checked too; anything but success raises PanError."""
+    r = SESSION.post(f"https://{pan_ip}/api/", data=params,
+                     headers={"X-PAN-KEY": api_key}, timeout=60)
     r.raise_for_status()
+    try:
+        root = ET.fromstring(r.text)  # noqa: S314 -- response from our own Panorama
+    except ET.ParseError as e:
+        raise PanError(f"unparseable response: {r.text[:200]}") from e
+    if root.get("status") != "success":
+        lines = [el.text.strip() for el in root.iter("line") if el.text and el.text.strip()]
+        raise PanError("; ".join(lines) or (root.findtext(".//msg") or r.text[:200]).strip())
     return r.text
+
+def api_get_config(pan_ip, api_key, xpath):
+    return api_call(pan_ip, api_key, type="config", action="get", xpath=xpath)
 
 def api_set_config(pan_ip, api_key, xpath, element_xml):
-    url = f"https://{pan_ip}/api/"
-    params = {"type": "config", "action": "set", "key": api_key, "xpath": xpath, "element": element_xml}
-    r = requests.post(url, params=params, verify=False, timeout=60)
-    r.raise_for_status()
-    return r.text
+    return api_call(pan_ip, api_key, type="config", action="set", xpath=xpath, element=element_xml)
 
 def api_delete_config(pan_ip, api_key, xpath):
-    url = f"https://{pan_ip}/api/"
-    params = {"type": "config", "action": "delete", "key": api_key, "xpath": xpath}
-    r = requests.post(url, params=params, verify=False, timeout=60)
-    r.raise_for_status()
-    return r.text
+    return api_call(pan_ip, api_key, type="config", action="delete", xpath=xpath)
 
 # --- XPaths for scopes --------------------------------------------------------
 
@@ -109,11 +130,19 @@ def container_xpath_for_scope(scope: str, obj_type: str) -> str:
     if scope.lower() == "shared":
         return f"/config/shared/{node}"
     return ("/config/devices/entry[@name='localhost.localdomain']"
-            f"/device-group/entry[@name='{scope}']/{node}")
+            f"/device-group/entry[@name={xpath_literal(scope)}]/{node}")
 
 def entry_xpath_for_scope(scope: str, obj_type: str, name: str) -> str:
     """Full xpath to the specific <entry name='...'> for the given scope."""
-    return container_xpath_for_scope(scope, obj_type) + f"/entry[@name='{name}']"
+    return container_xpath_for_scope(scope, obj_type) + f"/entry[@name={xpath_literal(name)}]"
+
+def xpath_literal(value: str) -> str:
+    """Quote a value as an XPath 1.0 string literal (handles embedded quotes)."""
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    return "concat(" + ", \"'\", ".join(f"'{p}'" for p in value.split("'")) + ")"
 
 # --- Parsing helpers ----------------------------------------------------------
 
@@ -198,7 +227,19 @@ def move_one(pan_ip, api_key, obj_name, obj_type, src_scope, dst_scope, logger, 
         return
 
     # 2) Collision check at destination
-    if object_exists_in_scope(pan_ip, api_key, dst_scope, obj_type, obj_name):
+    try:
+        dst_exists = object_exists_in_scope(pan_ip, api_key, dst_scope, obj_type, obj_name)
+    except Exception as e:
+        msg = f"API get failed at dst: {e}"
+        logger.writerow([now, obj_name, obj_type, src_scope, dst_scope, "error", msg, "", ""])
+        print(f"[!] {msg}")
+        return
+    if src_scope.strip().lower() == dst_scope.strip().lower():
+        msg = "Source and destination scope are the same. Skipping."
+        logger.writerow([now, obj_name, obj_type, src_scope, dst_scope, "skipped", msg, "", ""])
+        print(f"[-] {msg} ({obj_name})")
+        return
+    if dst_exists:
         if collision_policy == "skip":
             msg = "Destination already has object with same name. Skipping."
             summary = make_summary(obj_type, entry_elem)
@@ -256,6 +297,7 @@ def main():
     cfg = read_config("panw.cfg")
     pan_ip = cfg["panorama_ip"]
     api_key = cfg["api_key"]
+    SESSION.verify = tls_verify(cfg)
 
     # Optional behavior tweak via env var:
     collision_policy = os.getenv("MOVE_COLLISION", "skip").lower().strip()  # 'skip' or 'overwrite'
@@ -266,17 +308,21 @@ def main():
     # Expected CSV header: object_name,object_type,src_scope,dst_scope
     input_csv = sys.argv[1] if len(sys.argv) > 1 else "objects.csv"
     count = 0
-    with open(input_csv, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            obj_name = row["object_name"].strip()
-            obj_type = row["object_type"].strip()
-            src_scope = row["src_scope"].strip()
-            dst_scope = row["dst_scope"].strip()
-            move_one(pan_ip, api_key, obj_name, obj_type, src_scope, dst_scope, log_w, collision_policy=collision_policy)
-            count += 1
-
-    log_f.close()
+    try:
+        with open(input_csv, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not (row.get("object_name") or "").strip():
+                    continue
+                obj_name = row["object_name"].strip()
+                obj_type = row["object_type"].strip()
+                src_scope = row["src_scope"].strip()
+                dst_scope = row["dst_scope"].strip()
+                move_one(pan_ip, api_key, obj_name, obj_type, src_scope, dst_scope, log_w, collision_policy=collision_policy)
+                log_f.flush()
+                count += 1
+    finally:
+        log_f.close()
     print(f"[i] Processed {count} row(s).")
     print("[i] NOTE: This script does not commit changes. Commit in Panorama when ready.")
 

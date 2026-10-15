@@ -43,7 +43,16 @@ Key/value pairs, one per line:
 panorama_ip=192.168.1.10
 api_key=YOUR_API_KEY
 ```
+Optional settings:
+```
+verify_ssl=false              # lab only: skip TLS certificate verification (default: verify)
+ca_bundle=/path/to/ca.pem     # trust a private CA instead
+```
+The key can also be supplied via the `PANOS_API_KEY` environment variable. It is sent in the `X-PAN-KEY` header, never in the URL.
+
 > Keep `panw.cfg` out of Git (already in `.gitignore`).
+
+Every API response is checked for `status="success"`. If adding to the destination fails, the source object is left untouched and the row is logged as `error`.
 
 ## Input CSV (`objects.csv`)
 Header row:
