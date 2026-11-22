@@ -98,5 +98,10 @@ Each row contains the full `<entry ...>...</entry>` XML. You can restore by `set
 
 ---
 
-**Author:** Steve Boyle - PANW (NOT OFFICIALLY SUPPORTED) 
-MIT License
+**Author:** Steve Boyle
+
+**Status:** Independent, community-maintained project.
+
+**Disclaimer:** This project is not affiliated with, endorsed by, or supported by Palo Alto Networks. Palo Alto Networks, PAN-OS and Panorama are trademarks of Palo Alto Networks, Inc., used here only to describe what the script works with.
+
+**License:** MIT. See [LICENSE](LICENSE).
